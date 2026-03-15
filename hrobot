@@ -431,11 +431,19 @@ cmd_cancel() {
 # ─── Order Commands ───────────────────────────────────────────────────
 
 SB_FEED="https://www.hetzner.com/_resources/app/data/app/live_data_sb_EUR.json"
+CATALOG_FEED="https://www.hetzner.com/_resources/app/data/app/live_data_en_EUR.json"
 
 _sb_fetch() {
   local data
   data=$(curl -s "$SB_FEED") || die "Failed to fetch server market data"
   [ -n "$data" ] && echo "$data" | jq -e '.server' >/dev/null 2>&1 || die "Invalid response from server market"
+  echo "$data"
+}
+
+_catalog_fetch() {
+  local data
+  data=$(curl -s "$CATALOG_FEED") || die "Failed to fetch server catalog"
+  [ -n "$data" ] && echo "$data" | jq -e '.server' >/dev/null 2>&1 || die "Invalid response from server catalog"
   echo "$data"
 }
 
@@ -656,89 +664,104 @@ _select_keys() {
 
 cmd_catalog() {
   local action="${1:-list}"
-  need_auth
 
   case "$action" in
     list|ls)
       local data
-      data=$(api GET /order/server/product)
-      echo "$data" | table "DEDICATED SERVERS" \
-        "ID\tCPU\tRAM\tDISK\tLOCATIONS\tFROM\tSETUP" \
-        'def fmt_price: (.prices | sort_by(.price.net | tonumber) | first);
-         [.[] | .product]
-         | sort_by(fmt_price.price.net | tonumber)[]
+      data=$(_catalog_fetch)
+      # Deduplicate by name, pick cheapest variant per model
+      echo "$data" | jq '.server' | table "DEDICATED SERVERS" \
+        "NAME\tCPU\tRAM\tDISK\tLOCATIONS\tFROM\tSETUP" \
+        '[.[] | select(.category != "Upfront")]
+         | sort_by(.price)[]
          | [
-             .id,
-             (.description[0] // .cpu // "-"),
-             (.description | map(select(test("RAM|DDR"))) | first // "-" | split(" RAM") | first | split(", ") | first | ltrimstr("  ")),
-             (.description | map(select(test("SSD|HDD|NVMe"))) | first // "-"),
-             (.location | join(",")),
-             (fmt_price.price.net | rtrimstr("00") | rtrimstr("0")) + "€",
-             (fmt_price.price_setup.net | if . == "0.0000" then "free" else rtrimstr("00") | rtrimstr("0") | . + "€" end)
+             .name,
+             .cpu,
+             (.ram | tostring) + "GB",
+             (.hdd_arr | first // "-"),
+             ([.datacenter[].shortname] | join(",")),
+             (.price | tostring) + "€",
+             (if .setup_price == 0 then "free" else (.setup_price | tostring) + "€" end)
            ] | @tsv'
       ;;
     show|info)
-      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot catalog show <product-id>"
+      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot catalog show <name>"
       local data
-      data=$(api GET "/order/server/product/$id")
-      _catalog_detail "$data"
+      data=$(_catalog_fetch)
+      _catalog_detail "$data" "$id"
       ;;
     buy|order)
       local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot catalog buy <product-id>"
       _catalog_buy "$id"
       ;;
     *)
-      die "Usage: hrobot catalog [list|show <id>|buy <id>]"
+      die "Usage: hrobot catalog [list|show <name>|buy <id>]"
       ;;
   esac
 }
 
 _catalog_detail() {
   local data="$1"
-  local p
-  p=$(echo "$data" | jq '.product')
+  local name="$2"
 
-  local id name
-  id=$(echo "$p" | jq -r '.id')
-  name=$(echo "$p" | jq -r '.name')
+  # Find all variants matching this name (case-insensitive)
+  local variants
+  variants=$(echo "$data" | jq --arg n "$name" '[.server[] | select(.name | ascii_downcase == ($n | ascii_downcase))]')
+  local count
+  count=$(echo "$variants" | jq 'length')
+  [ "$count" -gt 0 ] || die "Server '$name' not found. Run: hrobot catalog"
 
-  local desc
-  desc=$(echo "$p" | jq -r '.description | join("\n")')
+  # Use the configurable (non-Upfront) variant for base info, fall back to first
+  local base
+  base=$(echo "$variants" | jq '[.[] | select(.category != "Upfront")] | first // .[0]')
 
-  local locations
-  locations=$(echo "$p" | jq -r '.location | join(", ")')
+  local cpu ram_hr is_ecc bw
+  cpu=$(echo "$base" | jq -r '.cpu')
+  ram_hr=$(echo "$base" | jq -r '.ram_hr // ((.ram | tostring) + " GB")')
+  is_ecc=$(echo "$base" | jq -r 'if .is_ecc then "yes" else "no" end')
+  bw=$(echo "$base" | jq -r '.Bandwidth // .bandwidth // 1000')
 
+  local disks_hr
+  disks_hr=$(echo "$base" | jq -r 'if (.hdd_hr | type) == "string" then .hdd_hr | gsub("\\\\r\\\\n"; "\n") else (.hdd_hr // .hdd_arr // []) | join("\n") end')
+
+  # Collect unique locations with pricing from Upfront variants
   local pricing
-  pricing=$(echo "$p" | jq -r '.prices[] | "    " + .location + "\t" + (.price.net | rtrimstr("00") | rtrimstr("0")) + "€/mo\t(" + (.price.hourly_net | rtrimstr("0")) + "€/hr, setup: " + (if .price_setup.net == "0.0000" then "free" else (.price_setup.net | rtrimstr("00") | rtrimstr("0")) + "€" end) + ")"')
+  pricing=$(echo "$variants" | jq -r '
+    [.[] | select(.category == "Upfront") | {
+      dc: ([.datacenter[].shortname] | join(",")),
+      price: .price,
+      setup: .setup_price,
+      hourly: .hourPrice
+    }] | sort_by(.price) | unique_by(.dc)[]
+    | "    " + .dc + "\t" + (.price | tostring) + "€/mo\t(" + (.hourly | tostring) + "€/hr, setup: " + (if .setup == 0 then "free" else (.setup | tostring) + "€" end) + ")"')
 
-  local addons
-  addons=$(echo "$p" | jq -r '
-    if (.orderable_addons | length) > 0 then
-      [.orderable_addons[] | "    " + .name + " (" + (.prices[0].price.net | rtrimstr("00") | rtrimstr("0")) + "€/mo)"] | join("\n")
-    else "    (none)" end')
+  # If no Upfront variants, show from configurable
+  if [ -z "$pricing" ]; then
+    pricing=$(echo "$base" | jq -r '
+      ([.datacenter[].shortname] | join(",")) as $dc
+      | "    " + $dc + "\t" + (.price | tostring) + "€/mo\t(setup: " + (if .setup_price == 0 then "free" else (.setup_price | tostring) + "€" end) + ")"')
+  fi
 
-  local dists
-  dists=$(echo "$p" | jq -r '.dist | join(", ")')
+  local specials
+  specials=$(echo "$base" | jq -r 'if (.specials // [] | length) > 0 then .specials | join(", ") else "(none)" end')
 
   if [ -t 1 ]; then
     echo ""
-    echo -e "  ${BOLD}${id}${NC} — ${name}"
+    echo -e "  ${BOLD}${name}${NC}"
     echo ""
-    echo -e "  ${DIM}Hardware${NC}"
-    echo "$desc" | while IFS= read -r line; do echo "    $line"; done
-    echo ""
-    echo -e "  ${DIM}Locations${NC}   $locations"
+    echo -e "  ${DIM}CPU${NC}         $cpu"
+    echo -e "  ${DIM}RAM${NC}         $ram_hr"
+    echo -e "  ${DIM}Disk${NC}"
+    echo "$disks_hr" | while IFS= read -r line; do echo "              $line"; done
+    echo -e "  ${DIM}Network${NC}     ${bw} Mbit/s"
+    echo -e "  ${DIM}ECC${NC}         $is_ecc"
+    echo -e "  ${DIM}Features${NC}    $specials"
     echo ""
     echo -e "  ${DIM}Pricing${NC}"
     echo "$pricing" | while IFS= read -r line; do echo -e "$line"; done | column -t -s $'\t'
     echo ""
-    echo -e "  ${DIM}Add-ons${NC}"
-    echo "$addons"
-    echo ""
-    echo -e "  ${DIM}OS${NC}          $dists"
-    echo ""
   else
-    echo "$p" | jq .
+    echo "$base" | jq .
   fi
 }
 
