@@ -73,12 +73,41 @@ fmt() {
   fi
 }
 
-# Table formatter: takes jq expression that produces tab-separated lines
+# Table formatter: reads JSON from stdin, outputs a clean table
+# Usage: echo "$json" | table "TITLE" "COL1\tCOL2" '.[] | [.a, .b] | @tsv'
 table() {
-  local header="$1"
-  local jq_expr="$2"
-  echo -e "${BOLD}$header${NC}"
-  jq -r "$jq_expr" 2>/dev/null | column -t -s $'\t' || cat
+  local title="$1"
+  local headers="$2"
+  local jq_expr="$3"
+
+  local data
+  data=$(jq -r "$jq_expr" 2>/dev/null) || true
+
+  if [ -t 1 ]; then
+    echo ""
+    echo -e "  ${BOLD}${title}${NC}"
+    echo ""
+    if [ -z "$data" ]; then
+      echo -e "  ${DIM}(none)${NC}"
+    else
+      local formatted
+      formatted=$( (echo -e "$headers" && echo "$data") | column -t -s $'\t' )
+      local first=true
+      while IFS= read -r line; do
+        if $first; then
+          echo -e "  ${DIM}${line}${NC}"
+          first=false
+        else
+          echo "  $line"
+        fi
+      done <<< "$formatted"
+    fi
+    echo ""
+  else
+    if [ -n "$data" ]; then
+      (echo -e "$headers" && echo "$data") | column -t -s $'\t'
+    fi
+  fi
 }
 
 # ─── Commands ────────────────────────────────────────────────────────
@@ -131,9 +160,10 @@ cmd_status() {
 
 cmd_servers() {
   need_auth
-  api GET /server | table "SERVERS" \
-    '.[] | .server | [.server_number, .server_name, .server_ip, .product, .dc, .status] | @tsv' |
-    (echo -e "NUMBER\tNAME\tIP\tPRODUCT\tDC\tSTATUS" && cat) | column -t -s $'\t'
+  local data
+  data=$(api GET /server)
+  echo "$data" | table "SERVERS" "NUMBER\tNAME\tIP\tPRODUCT\tDC\tSTATUS" \
+    '.[] | .server | [.server_number, .server_name, .server_ip, .product, .dc, .status] | @tsv'
 }
 
 cmd_server() {
@@ -213,9 +243,10 @@ cmd_boot() {
 
 cmd_ips() {
   need_auth
-  api GET /ip | table "IP ADDRESSES" \
-    '.[] | .ip | [.ip, .server_number, .locked, .traffic_warnings] | @tsv' |
-    (echo -e "IP\tSERVER\tLOCKED\tTRAFFIC_WARNINGS" && cat) | column -t -s $'\t'
+  local data
+  data=$(api GET /ip)
+  echo "$data" | table "IP ADDRESSES" "IP\tSERVER\tLOCKED\tTRAFFIC" \
+    '.[] | .ip | [.ip, .server_number, .locked, .traffic_warnings] | @tsv'
 }
 
 cmd_ip() {
@@ -239,9 +270,10 @@ cmd_rdns() {
 
   case "$action" in
     list)
-      api GET /rdns | table "REVERSE DNS" \
-        '.[] | .rdns | [.ip, .ptr] | @tsv' |
-        (echo -e "IP\tPTR" && cat) | column -t -s $'\t'
+      local data
+      data=$(api GET /rdns)
+      echo "$data" | table "REVERSE DNS" "IP\tPTR" \
+        '.[] | .rdns | [.ip, .ptr] | @tsv'
       ;;
     get)
       local ip="${2:-}" ; [ -n "$ip" ] || die "Usage: hrobot rdns get <ip>"
@@ -289,9 +321,10 @@ cmd_firewall() {
 
 cmd_keys() {
   need_auth
-  api GET /key | table "SSH KEYS" \
-    '.[] | .key | [.name, .fingerprint, .type, .size] | @tsv' |
-    (echo -e "NAME\tFINGERPRINT\tTYPE\tSIZE" && cat) | column -t -s $'\t'
+  local data
+  data=$(api GET /key)
+  echo "$data" | table "SSH KEYS" "NAME\tFINGERPRINT\tTYPE\tSIZE" \
+    '.[] | .key | [.name, .fingerprint, .type, .size] | @tsv'
 }
 
 cmd_key() {
@@ -334,17 +367,20 @@ cmd_traffic() {
 
   local from to type
   case "$period" in
-    daily)   from=$(date -d "1 day ago" +%Y-%m-%dT00:00:00+00:00); to=$(date +%Y-%m-%dT23:59:59+00:00); type="day" ;;
-    monthly) from=$(date +%Y-%m-01T00:00:00+00:00); to=$(date +%Y-%m-%dT23:59:59+00:00); type="month" ;;
-    yearly)  from=$(date +%Y-01-01T00:00:00+00:00); to=$(date +%Y-%m-%dT23:59:59+00:00); type="year" ;;
+    daily)   from=$(date +%Y-%m-%dT00); to=$(date +%Y-%m-%dT%H); type="day" ;;
+    monthly) from=$(date +%Y-%m-01); to=$(date +%Y-%m-%d); type="month" ;;
+    yearly)  from=$(date +%Y-01); to=$(date +%Y-%m); type="year" ;;
     *)       die "Period must be: daily, monthly, or yearly" ;;
   esac
 
+  local server_ip
+  server_ip=$(api GET "/server/$num" | jq -r '.server.server_ip')
+
   api POST /traffic \
-    -d "ip[]=$(api GET "/server/$num" | jq -r '.server.server_ip')" \
-    -d "from=$from" \
-    -d "to=$to" \
-    -d "type=$type" | fmt
+    --data-urlencode "ip=$server_ip" \
+    --data-urlencode "from=$from" \
+    --data-urlencode "to=$to" \
+    --data-urlencode "type=$type" | fmt
 }
 
 # ─── WoL Commands ─────────────────────────────────────────────────────
@@ -360,9 +396,10 @@ cmd_wol() {
 
 cmd_storageboxes() {
   need_auth
-  api GET /storagebox | table "STORAGE BOXES" \
-    '.[] | .storagebox | [.id, .name, .login, (.disk // 0 | tostring) + "/" + (.disk_quota // 0 | tostring) + "G"] | @tsv' |
-    (echo -e "ID\tNAME\tLOGIN\tDISK" && cat) | column -t -s $'\t'
+  local data
+  data=$(api GET /storagebox)
+  echo "$data" | table "STORAGE BOXES" "ID\tNAME\tLOGIN\tDISK" \
+    '.[] | .storagebox | [.id, .name, .login, (.disk // 0 | tostring) + "/" + (.disk_quota // 0 | tostring) + "G"] | @tsv'
 }
 
 cmd_storagebox() {
@@ -393,30 +430,395 @@ cmd_cancel() {
 
 # ─── Order Commands ───────────────────────────────────────────────────
 
-cmd_order() {
-  local action="${1:-products}"
+SB_FEED="https://www.hetzner.com/_resources/app/data/app/live_data_sb_EUR.json"
+
+_sb_fetch() {
+  local data
+  data=$(curl -s "$SB_FEED") || die "Failed to fetch server market data"
+  [ -n "$data" ] && echo "$data" | jq -e '.server' >/dev/null 2>&1 || die "Invalid response from server market"
+  echo "$data"
+}
+
+cmd_market() {
+  local action="${1:-list}"
+
+  case "$action" in
+    list|ls)
+      local data
+      data=$(_sb_fetch)
+      local count
+      count=$(echo "$data" | jq '.server | length')
+      echo "$data" | jq '.server' | table "SERVER AUCTION ($count servers)" \
+        "ID\tCPU\tRAM\tDISK\tDC\tNEXT DROP\tPRICE" \
+        'def fmt_disk:
+           def disk_type:
+             if (.serverDiskData.nvme | length) > 0 and (.serverDiskData.sata | length) > 0 then "NVMe+SSD"
+             elif (.serverDiskData.nvme | length) > 0 then "NVMe"
+             elif (.serverDiskData.hdd | length) > 0 and (.serverDiskData.sata | length) > 0 then "HDD+SSD"
+             elif (.serverDiskData.hdd | length) > 0 then "HDD"
+             elif (.hdd_arr | length) > 0 then (.hdd_arr[0] | split("TB ") | last | split("GB ") | last)
+             else "HDD" end;
+           (.hdd_count | tostring) + "x " +
+           (if .hdd_size >= 1024 then ((.hdd_size / 1024 * 10 | floor / 10) | tostring) + "TB"
+            else (.hdd_size | tostring) + "GB" end) + " " + disk_type;
+         def fmt_reduce:
+           if .next_reduce > 3600 then
+             ((.next_reduce / 3600 | floor) | tostring) + "h " + ((.next_reduce % 3600 / 60 | floor) | tostring) + "m"
+           elif .next_reduce > 0 then
+             ((.next_reduce / 60 | floor) | tostring) + "m"
+           else "-" end;
+         [.[] | {id, cpu, ram_size, hdd_count, hdd_size, hdd_arr, serverDiskData, datacenter, price, next_reduce, fixed_price}]
+         | sort_by(.price)[]
+         | [
+             .id,
+             .cpu,
+             (.ram_size | tostring) + "GB",
+             fmt_disk,
+             .datacenter,
+             (if .fixed_price then "fixed" else fmt_reduce end),
+             (.price | tostring) + "€"
+           ] | @tsv'
+      ;;
+    show|info)
+      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot market show <product-id>"
+      local data
+      data=$(_sb_fetch)
+      local server
+      server=$(echo "$data" | jq --argjson id "$id" '.server[] | select(.id == $id)')
+      [ -n "$server" ] || die "Server $id not found in market"
+      _market_detail "$server"
+      ;;
+    buy|order)
+      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot market buy <product-id>"
+      _market_buy "$id"
+      ;;
+    transactions|tx)
+      need_auth
+      local data
+      data=$(api GET /order/server_market/transaction)
+      echo "$data" | table "MARKET TRANSACTIONS" "ID\tDATE\tSTATUS\tSERVER\tPRODUCT" \
+        '.[] | .transaction | [.id, (.date | split("T") | first), .status, (.server_number // "-"), (.product.cpu // "-")] | @tsv'
+      ;;
+    *)
+      die "Usage: hrobot market [list|show <id>|buy <id>|transactions]"
+      ;;
+  esac
+}
+
+_market_detail() {
+  local p="$1"
+
+  local id cpu ram ram_hr dc price hourly setup bw ecc specials reduce fixed
+  id=$(echo "$p" | jq -r '.id')
+  cpu=$(echo "$p" | jq -r '(.cpu_count | tostring) + "x " + .cpu')
+  ram=$(echo "$p" | jq -r '.ram_size')
+  ram_hr=$(echo "$p" | jq -r '.ram | join(", ")')
+  dc=$(echo "$p" | jq -r '.datacenter')
+  price=$(echo "$p" | jq -r '.price')
+  hourly=$(echo "$p" | jq -r '.hourly_price')
+  setup=$(echo "$p" | jq -r '.setup_price')
+  bw=$(echo "$p" | jq -r '.bandwidth')
+  ecc=$(echo "$p" | jq -r 'if .is_ecc then "yes" else "no" end')
+  specials=$(echo "$p" | jq -r 'if (.specials | length) > 0 then .specials | join(", ") else "(none)" end')
+  fixed=$(echo "$p" | jq -r '.fixed_price')
+  reduce=$(echo "$p" | jq -r '
+    if .fixed_price then "fixed"
+    elif .next_reduce > 3600 then ((.next_reduce / 3600 | floor) | tostring) + "h " + ((.next_reduce % 3600 / 60 | floor) | tostring) + "m"
+    elif .next_reduce > 0 then ((.next_reduce / 60 | floor) | tostring) + "m"
+    else "-" end')
+
+  if [ -t 1 ]; then
+    echo ""
+    echo -e "  ${BOLD}SERVER #${id}${NC}"
+    echo ""
+    echo -e "  ${DIM}CPU${NC}         $cpu"
+    echo -e "  ${DIM}RAM${NC}         ${ram}GB ${DIM}($ram_hr)${NC}"
+    echo -e "  ${DIM}Disk${NC}"
+    echo "$p" | jq -r '.hdd_hr[]' | while IFS= read -r line; do echo "              $line"; done
+    echo -e "  ${DIM}Network${NC}     ${bw} Mbit/s"
+    echo -e "  ${DIM}Location${NC}    $dc"
+    echo -e "  ${DIM}ECC${NC}         $ecc"
+    echo -e "  ${DIM}Features${NC}    $specials"
+    echo ""
+    echo -e "  ${DIM}Price${NC}       ${BOLD}${price}€/mo${NC}  ${DIM}(${hourly}€/hr, setup: ${setup}€)${NC}"
+    if [ "$fixed" = "false" ]; then
+      echo -e "  ${DIM}Next drop${NC}   ${YELLOW}${reduce}${NC}"
+    else
+      echo -e "  ${DIM}Type${NC}        Fixed price"
+    fi
+    echo ""
+  else
+    echo "$p" | jq .
+  fi
+}
+
+_market_buy() {
+  local id="$1"
+
+  # Show product from public feed first
+  local sb_data server
+  sb_data=$(_sb_fetch)
+  server=$(echo "$sb_data" | jq --argjson id "$id" '.server[] | select(.id == $id)')
+  [ -n "$server" ] || die "Server $id not found in market"
+  _market_detail "$server"
+
+  local price
+  price=$(echo "$server" | jq -r '.price')
+
+  # Auth needed for ordering
+  need_auth
+
+  # Select SSH keys
+  _select_keys
+
+  # Final confirmation
+  echo ""
+  warn "  ⚠ This will order a server for ${price}€/month"
+  echo ""
+  read -rp "  Type 'YES' to confirm the order: " confirm
+  [ "$confirm" = "YES" ] || { echo "  Cancelled."; return; }
+
+  # Place the order
+  local -a curl_args=()
+  curl_args+=(-d "product_id=$id")
+  for fp in "${_SELECTED_KEYS[@]}"; do
+    curl_args+=(--data-urlencode "authorized_key[]=$fp")
+  done
+
+  echo ""
+  echo -n "  Placing order... "
+  local result
+  result=$(api POST /order/server_market/transaction "${curl_args[@]}")
+
+  local txn_id txn_status
+  txn_id=$(echo "$result" | jq -r '.transaction.id')
+  txn_status=$(echo "$result" | jq -r '.transaction.status')
+
+  info "✓ Done!"
+  echo ""
+  echo -e "  ${BOLD}Order Placed${NC}"
+  echo -e "  ${DIM}Transaction${NC}  $txn_id"
+  echo -e "  ${DIM}Status${NC}       $txn_status"
+  echo ""
+  dim "  Track with: hrobot market transactions"
+  echo ""
+}
+
+# ─── Shared: SSH Key Selection ───────────────────────────────────────
+# Sets _SELECTED_KEYS array with chosen fingerprints
+
+_select_keys() {
+  local keys_data
+  keys_data=$(api GET /key)
+  local key_count
+  key_count=$(echo "$keys_data" | jq 'length')
+
+  [ "$key_count" -gt 0 ] || die "No SSH keys found. Add one first: hrobot key add <name> <key-file>"
+
+  echo -e "  ${BOLD}SSH Keys${NC}"
+  echo ""
+  local i=1
+  while IFS=$'\t' read -r name fp; do
+    echo -e "    ${GREEN}${i})${NC} ${name} ${DIM}(${fp})${NC}"
+    i=$((i + 1))
+  done < <(echo "$keys_data" | jq -r '.[] | .key | [.name, .fingerprint] | @tsv')
+  echo ""
+
+  local selection
+  if [ "$key_count" -eq 1 ]; then
+    selection="1"
+    echo -e "  ${DIM}Using your only SSH key.${NC}"
+  else
+    read -rp "  Select key(s) [1-${key_count}, comma-separated, or 'all']: " selection
+    [ -n "$selection" ] || { echo "  Cancelled."; exit 0; }
+  fi
+
+  _SELECTED_KEYS=()
+  if [ "$selection" = "all" ]; then
+    while IFS= read -r fp; do
+      _SELECTED_KEYS+=("$fp")
+    done < <(echo "$keys_data" | jq -r '.[] | .key | .fingerprint')
+  else
+    IFS=',' read -ra indices <<< "$selection"
+    local all_fps
+    all_fps=$(echo "$keys_data" | jq -r '.[] | .key | .fingerprint')
+    for idx in "${indices[@]}"; do
+      idx=$(echo "$idx" | tr -d ' ')
+      local fp
+      fp=$(echo "$all_fps" | sed -n "${idx}p")
+      [ -n "$fp" ] || die "Invalid key number: $idx"
+      _SELECTED_KEYS+=("$fp")
+    done
+  fi
+}
+
+# ─── Catalog (New Servers) ───────────────────────────────────────────
+
+cmd_catalog() {
+  local action="${1:-list}"
   need_auth
 
   case "$action" in
-    products|list)
-      api GET /order/server/product | table "AVAILABLE SERVERS" \
-        '.[] | .product | [.id, .name, (.price | tostring) + " " + .price_setup_recurring, .cpu, .memory, (.hdd_text // .description)] | @tsv' |
-        (echo -e "ID\tNAME\tPRICE\tCPU\tRAM\tDISK" && cat) | column -t -s $'\t'
+    list|ls)
+      local data
+      data=$(api GET /order/server/product)
+      echo "$data" | table "DEDICATED SERVERS" \
+        "ID\tCPU\tRAM\tDISK\tLOCATIONS\tFROM\tSETUP" \
+        'def fmt_price: (.prices | sort_by(.price.net | tonumber) | first);
+         [.[] | .product]
+         | sort_by(fmt_price.price.net | tonumber)[]
+         | [
+             .id,
+             (.description[0] // .cpu // "-"),
+             (.description | map(select(test("RAM|DDR"))) | first // "-" | split(" RAM") | first | split(", ") | first | ltrimstr("  ")),
+             (.description | map(select(test("SSD|HDD|NVMe"))) | first // "-"),
+             (.location | join(",")),
+             (fmt_price.price.net | rtrimstr("00") | rtrimstr("0")) + "€",
+             (fmt_price.price_setup.net | if . == "0.0000" then "free" else rtrimstr("00") | rtrimstr("0") | . + "€" end)
+           ] | @tsv'
       ;;
-    market)
-      api GET /order/server_market/product | fmt
+    show|info)
+      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot catalog show <product-id>"
+      local data
+      data=$(api GET "/order/server/product/$id")
+      _catalog_detail "$data"
       ;;
-    transactions)
-      api GET /order/server/transaction | fmt
-      ;;
-    product)
-      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot order product <product-id>"
-      api GET "/order/server/product/$id" | fmt
+    buy|order)
+      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot catalog buy <product-id>"
+      _catalog_buy "$id"
       ;;
     *)
-      die "Usage: hrobot order [products|market|transactions|product <id>]"
+      die "Usage: hrobot catalog [list|show <id>|buy <id>]"
       ;;
   esac
+}
+
+_catalog_detail() {
+  local data="$1"
+  local p
+  p=$(echo "$data" | jq '.product')
+
+  local id name
+  id=$(echo "$p" | jq -r '.id')
+  name=$(echo "$p" | jq -r '.name')
+
+  local desc
+  desc=$(echo "$p" | jq -r '.description | join("\n")')
+
+  local locations
+  locations=$(echo "$p" | jq -r '.location | join(", ")')
+
+  local pricing
+  pricing=$(echo "$p" | jq -r '.prices[] | "    " + .location + "\t" + (.price.net | rtrimstr("00") | rtrimstr("0")) + "€/mo\t(" + (.price.hourly_net | rtrimstr("0")) + "€/hr, setup: " + (if .price_setup.net == "0.0000" then "free" else (.price_setup.net | rtrimstr("00") | rtrimstr("0")) + "€" end) + ")"')
+
+  local addons
+  addons=$(echo "$p" | jq -r '
+    if (.orderable_addons | length) > 0 then
+      [.orderable_addons[] | "    " + .name + " (" + (.prices[0].price.net | rtrimstr("00") | rtrimstr("0")) + "€/mo)"] | join("\n")
+    else "    (none)" end')
+
+  local dists
+  dists=$(echo "$p" | jq -r '.dist | join(", ")')
+
+  if [ -t 1 ]; then
+    echo ""
+    echo -e "  ${BOLD}${id}${NC} — ${name}"
+    echo ""
+    echo -e "  ${DIM}Hardware${NC}"
+    echo "$desc" | while IFS= read -r line; do echo "    $line"; done
+    echo ""
+    echo -e "  ${DIM}Locations${NC}   $locations"
+    echo ""
+    echo -e "  ${DIM}Pricing${NC}"
+    echo "$pricing" | while IFS= read -r line; do echo -e "$line"; done | column -t -s $'\t'
+    echo ""
+    echo -e "  ${DIM}Add-ons${NC}"
+    echo "$addons"
+    echo ""
+    echo -e "  ${DIM}OS${NC}          $dists"
+    echo ""
+  else
+    echo "$p" | jq .
+  fi
+}
+
+_catalog_buy() {
+  local id="$1"
+  need_auth
+
+  # Fetch product details
+  local product
+  product=$(api GET "/order/server/product/$id")
+  _catalog_detail "$product"
+
+  local p
+  p=$(echo "$product" | jq '.product')
+
+  # Location selection
+  local -a locs
+  mapfile -t locs < <(echo "$p" | jq -r '.location[]')
+  local location
+
+  if [ "${#locs[@]}" -eq 1 ]; then
+    location="${locs[0]}"
+    echo -e "  ${DIM}Location: ${location}${NC}"
+  else
+    echo -e "  ${BOLD}Location${NC}"
+    echo ""
+    local i=1
+    for loc in "${locs[@]}"; do
+      local loc_price
+      loc_price=$(echo "$p" | jq -r --arg loc "$loc" '.prices[] | select(.location == $loc) | (.price.net | rtrimstr("00") | rtrimstr("0")) + "€/mo"')
+      echo -e "    ${GREEN}${i})${NC} ${loc} ${DIM}(${loc_price})${NC}"
+      i=$((i + 1))
+    done
+    echo ""
+    read -rp "  Select location [1-${#locs[@]}]: " loc_idx
+    [ -n "$loc_idx" ] || { echo "  Cancelled."; return; }
+    location="${locs[$((loc_idx - 1))]}"
+    [ -n "$location" ] || die "Invalid location"
+  fi
+
+  local price setup
+  price=$(echo "$p" | jq -r --arg loc "$location" '.prices[] | select(.location == $loc) | .price.net | rtrimstr("00") | rtrimstr("0")')
+  setup=$(echo "$p" | jq -r --arg loc "$location" '.prices[] | select(.location == $loc) | .price_setup.net | rtrimstr("00") | rtrimstr("0")')
+
+  # SSH key selection
+  echo ""
+  _select_keys
+
+  # Final confirmation
+  echo ""
+  warn "  ⚠ This will order ${id} in ${location} for ${price}€/month (setup: ${setup}€)"
+  echo ""
+  read -rp "  Type 'YES' to confirm the order: " confirm
+  [ "$confirm" = "YES" ] || { echo "  Cancelled."; return; }
+
+  # Place the order
+  local -a curl_args=()
+  curl_args+=(-d "product_id=$id")
+  curl_args+=(-d "location=$location")
+  for fp in "${_SELECTED_KEYS[@]}"; do
+    curl_args+=(--data-urlencode "authorized_key[]=$fp")
+  done
+
+  echo ""
+  echo -n "  Placing order... "
+  local result
+  result=$(api POST /order/server/transaction "${curl_args[@]}")
+
+  local txn_id txn_status
+  txn_id=$(echo "$result" | jq -r '.transaction.id')
+  txn_status=$(echo "$result" | jq -r '.transaction.status')
+
+  info "✓ Done!"
+  echo ""
+  echo -e "  ${BOLD}Order Placed${NC}"
+  echo -e "  ${DIM}Transaction${NC}  $txn_id"
+  echo -e "  ${DIM}Status${NC}       $txn_status"
+  echo ""
+  dim "  Track with: hrobot catalog show or check robot.hetzner.com"
+  echo ""
 }
 
 # ─── vSwitch Commands ─────────────────────────────────────────────────
@@ -479,54 +881,65 @@ cmd_failover() {
 # ─── Main ─────────────────────────────────────────────────────────────
 
 usage() {
-  cat << 'EOF'
-hrobot — CLI for Hetzner Robot API (dedicated servers)
+  local b d g bl n
+  if [ -t 1 ]; then
+    b=$'\033[1m' d=$'\033[2m' g=$'\033[0;32m' bl=$'\033[0;34m' n=$'\033[0m'
+  else
+    b="" d="" g="" bl="" n=""
+  fi
 
-USAGE
-  hrobot <command> [args...]
-
-AUTH
-  auth               Authenticate with Hetzner Robot API
-  status             Check authentication and API connection
-
-SERVERS
-  servers            List all servers
-  server <num>       Show server details
-  rename <num> <n>   Rename a server
-  reset <num> [type] Reset server (sw=software, hw=hardware, man=manual)
-  wol <num>          Send Wake-on-LAN packet
-  cancel <num>       Cancel a server (with confirmation)
-  boot <num>         Show boot configuration
-  rescue <num> [..] Manage rescue mode (status|activate|deactivate|last)
-
-NETWORK
-  ips                List all IP addresses
-  ip <addr>          Show IP details
-  subnets            List all subnets
-  rdns [action]      Manage reverse DNS (list|get|set|del)
-  firewall <num>     Show/manage firewall (status|disable)
-  failover [action]  Manage failover IPs (list|get|switch)
-  vswitch [action]   Manage vSwitches (list|get|create|del)
-  traffic <num> [p]  Show traffic stats (daily|monthly|yearly)
-
-SSH KEYS
-  keys               List SSH keys
-  key [action]       Manage keys (list|add|del)
-
-STORAGE
-  storageboxes       List storage boxes
-  storagebox <id>    Show storage box details
-
-ORDERING
-  order [action]     Browse/order servers (products|market|product <id>)
-
-OPTIONS
-  -h, --help         Show this help
-  -v, --version      Show version
-
-ENVIRONMENT
-  HROBOT_CONFIG_DIR  Config directory (default: ~/.config/hrobot)
-EOF
+  echo "${b}hrobot${n} — CLI for Hetzner Robot API (dedicated servers)"
+  echo ""
+  echo "  Usage: hrobot ${bl}<command>${n} [args...]"
+  echo ""
+  echo "${b}AUTH${n}"
+  echo "  ${g}auth${n}               Authenticate with Hetzner Robot API"
+  echo "  ${g}status${n}             Check authentication and API connection"
+  echo ""
+  echo "${b}SERVERS${n}"
+  echo "  ${g}servers${n}            List all servers"
+  echo "  ${g}server${n} <num>       Show server details"
+  echo "  ${g}rename${n} <num> <n>   Rename a server"
+  echo "  ${g}reset${n} <num> [type] Reset server (sw|hw|man)"
+  echo "  ${g}wol${n} <num>          Send Wake-on-LAN packet"
+  echo "  ${g}cancel${n} <num>       Cancel a server ${d}(with confirmation)${n}"
+  echo "  ${g}boot${n} <num>         Show boot configuration"
+  echo "  ${g}rescue${n} <num> [..]  Manage rescue mode (status|activate|deactivate|last)"
+  echo ""
+  echo "${b}NETWORK${n}"
+  echo "  ${g}ips${n}                List all IP addresses"
+  echo "  ${g}ip${n} <addr>          Show IP details"
+  echo "  ${g}subnets${n}            List all subnets"
+  echo "  ${g}rdns${n} [action]      Manage reverse DNS (list|get|set|del)"
+  echo "  ${g}firewall${n} <num>     Show/manage firewall (status|disable)"
+  echo "  ${g}failover${n} [action]  Manage failover IPs (list|get|switch)"
+  echo "  ${g}vswitch${n} [action]   Manage vSwitches (list|get|create|del)"
+  echo "  ${g}traffic${n} <num> [p]  Show traffic stats (daily|monthly|yearly)"
+  echo ""
+  echo "${b}SSH KEYS${n}"
+  echo "  ${g}keys${n}               List SSH keys"
+  echo "  ${g}key${n} [action]       Manage keys (list|add|del)"
+  echo ""
+  echo "${b}STORAGE${n}"
+  echo "  ${g}storageboxes${n}       List storage boxes"
+  echo "  ${g}storagebox${n} <id>    Show storage box details"
+  echo ""
+  echo "${b}SERVER MARKET${n} ${d}(auction / refurbished)${n}"
+  echo "  ${g}market${n}             List auction servers ${d}(sorted by price)${n}"
+  echo "  ${g}market show${n} <id>   Show server details"
+  echo "  ${g}market buy${n} <id>    Order a server ${d}(with confirmation)${n}"
+  echo "  ${g}market tx${n}          List market transactions"
+  echo ""
+  echo "${b}SERVER CATALOG${n} ${d}(new / standard)${n}"
+  echo "  ${g}catalog${n}            List dedicated servers with pricing"
+  echo "  ${g}catalog show${n} <id>  Show server details, OS, locations"
+  echo "  ${g}catalog buy${n} <id>   Order a server ${d}(with confirmation)${n}"
+  echo ""
+  echo "${b}OPTIONS${n}"
+  echo "  ${g}-h${n}, ${g}--help${n}         Show this help"
+  echo "  ${g}-v${n}, ${g}--version${n}      Show version"
+  echo ""
+  echo "${d}Config: \$HROBOT_CONFIG_DIR (default: ~/.config/hrobot)${n}"
 }
 
 main() {
@@ -559,7 +972,8 @@ main() {
     key)            cmd_key "$@" ;;
     storageboxes)   cmd_storageboxes "$@" ;;
     storagebox)     cmd_storagebox "$@" ;;
-    order)          cmd_order "$@" ;;
+    market|sb)      cmd_market "$@" ;;
+    catalog|new)    cmd_catalog "$@" ;;
     -v|--version|version) echo "hrobot $VERSION" ;;
     -h|--help|help) usage ;;
     *)              die "Unknown command: $cmd. Run 'hrobot help' for usage." ;;
