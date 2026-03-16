@@ -455,15 +455,60 @@ _catalog_fetch() {
 }
 
 cmd_market() {
-  local action="${1:-list}"
+  # Parse flags
+  local min_ram=0 max_price=999999 dc_filter="" cpu_filter="" disk_filter="" ecc_only=false sort_by="price"
+  local -a args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ram)      min_ram="${2:-0}" ; shift 2 ;;
+      --price)    max_price="${2:-999999}" ; shift 2 ;;
+      --dc)       dc_filter="${2:-}" ; shift 2 ;;
+      --cpu)      cpu_filter="${2:-}" ; shift 2 ;;
+      --nvme)     disk_filter="nvme" ; shift ;;
+      --ssd)      disk_filter="ssd" ; shift ;;
+      --hdd)      disk_filter="hdd" ; shift ;;
+      --ecc)      ecc_only=true ; shift ;;
+      --sort)     sort_by="${2:-price}" ; shift 2 ;;
+      -*)         die "Unknown flag: $1. Filters: --ram N --price N --dc X --cpu X --nvme --ssd --hdd --ecc --sort price|ram|disk|drop" ;;
+      *)          args+=("$1") ; shift ;;
+    esac
+  done
+
+  local action="${args[0]:-list}"
 
   case "$action" in
     list|ls)
       local data
       data=$(_sb_fetch)
+      # Filter and sort
+      local filtered
+      filtered=$(echo "$data" | jq \
+        --argjson min_ram "$min_ram" \
+        --argjson max_price "$max_price" \
+        --arg dc "$dc_filter" \
+        --arg cpu "$cpu_filter" \
+        --arg disk "$disk_filter" \
+        --arg ecc "$ecc_only" \
+        --arg sort "$sort_by" \
+        '[.server[]
+          | select(.ram_size >= $min_ram)
+          | select(.price <= $max_price)
+          | select(if $dc != "" then (.datacenter | ascii_downcase | contains($dc | ascii_downcase)) else true end)
+          | select(if $cpu != "" then (.cpu | ascii_downcase | contains($cpu | ascii_downcase)) else true end)
+          | select(if $disk == "nvme" then (.serverDiskData.nvme | length) > 0
+                   elif $disk == "ssd" then (.serverDiskData.sata | length) > 0
+                   elif $disk == "hdd" then (.serverDiskData.hdd | length) > 0
+                   else true end)
+          | select(if $ecc == "true" then .is_ecc else true end)
+        ] | sort_by(
+          if $sort == "ram" then .ram_size
+          elif $sort == "disk" then .hdd_size
+          elif $sort == "drop" then (if .fixed_price then 999999 else .next_reduce end)
+          else .price end
+        )')
       local count
-      count=$(echo "$data" | jq '.server | length')
-      echo "$data" | jq '.server' | table "SERVER AUCTION ($count servers)" \
+      count=$(echo "$filtered" | jq 'length')
+      echo "$filtered" | table "SERVER AUCTION ($count servers)" \
         "PRICE\tID\tCPU\tRAM\tDISK\tDC\tNEXT DROP" \
         'def fmt_disk:
            def disk_type:
@@ -482,8 +527,7 @@ cmd_market() {
            elif .next_reduce > 0 then
              ((.next_reduce / 60 | floor) | tostring) + "m"
            else "-" end;
-         [.[] | {id, cpu, ram_size, hdd_count, hdd_size, hdd_arr, serverDiskData, datacenter, price, next_reduce, fixed_price}]
-         | sort_by(.price)[]
+         .[]
          | [
              (.price | tostring) + "€",
              .id,
@@ -495,7 +539,7 @@ cmd_market() {
            ] | @tsv'
       ;;
     show|info)
-      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot market show <product-id>"
+      local id="${args[1]:-}" ; [ -n "$id" ] || die "Usage: hrobot market show <product-id>"
       local data
       data=$(_sb_fetch)
       local server
@@ -504,7 +548,7 @@ cmd_market() {
       _market_detail "$server"
       ;;
     buy|order)
-      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot market buy <product-id>"
+      local id="${args[1]:-}" ; [ -n "$id" ] || die "Usage: hrobot market buy <product-id>"
       _market_buy "$id"
       ;;
     transactions|tx)
@@ -515,7 +559,7 @@ cmd_market() {
         '.[] | .transaction | [.id, (.date | split("T") | first), .status, (.server_number // "-"), (.product.cpu // "-")] | @tsv'
       ;;
     *)
-      die "Usage: hrobot market [list|show <id>|buy <id>|transactions]"
+      die "Unknown: $action. Usage: hrobot market [list|show <id>|buy <id>|tx] [--ram N --price N --dc X --cpu X --nvme --ssd --hdd --ecc --sort price|ram|disk|drop]"
       ;;
   esac
 }
@@ -670,19 +714,28 @@ _select_keys() {
 # ─── Catalog (New Servers) ───────────────────────────────────────────
 
 cmd_catalog() {
-  local action="${1:-list}"
+  local sort_by="price"
+  local -a args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sort)  sort_by="${2:-price}" ; shift 2 ;;
+      -*)      die "Unknown flag: $1. Options: --sort price|ram|name" ;;
+      *)       args+=("$1") ; shift ;;
+    esac
+  done
+
+  local action="${args[0]:-list}"
 
   case "$action" in
     list|ls)
       local data
       data=$(_catalog_fetch)
-      # Deduplicate by name, pick cheapest variant per model
-      echo "$data" | jq '.server' | table "DEDICATED SERVERS" \
+      echo "$data" | jq --arg sort "$sort_by" '.server' | table "DEDICATED SERVERS" \
         "FROM\tSETUP\tNAME\tCPU\tRAM\tDISK\tDC" \
         'def short_disk: gsub("Datacenter Edition "; "DC ") | gsub("Datacenter Edition"; "DC") | gsub(" \\(Gen4\\)"; "") | gsub(" \\(Gen 4\\)"; "") | gsub(" \\(Gen3\\)"; "") | gsub(" \\(Gen 3\\)"; "");
          def short_cpu: gsub("™"; "") | gsub("®"; "") | gsub(" Prozessor"; "");
          [.[] | select(.category != "Upfront")]
-         | sort_by(.price)[]
+         | sort_by(if $ARGS.named.sort == "ram" then .ram elif $ARGS.named.sort == "name" then .name else .price end)[]
          | [
              (.price | tostring) + "€",
              (if .setup_price == 0 then "free" else (.setup_price | tostring) + "€" end),
@@ -694,13 +747,13 @@ cmd_catalog() {
            ] | @tsv'
       ;;
     show|info)
-      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot catalog show <name>"
+      local id="${args[1]:-}" ; [ -n "$id" ] || die "Usage: hrobot catalog show <name>"
       local data
       data=$(_catalog_fetch)
       _catalog_detail "$data" "$id"
       ;;
     buy|order)
-      local id="${2:-}" ; [ -n "$id" ] || die "Usage: hrobot catalog buy <product-id>"
+      local id="${args[1]:-}" ; [ -n "$id" ] || die "Usage: hrobot catalog buy <product-id>"
       _catalog_buy "$id"
       ;;
     *)
@@ -922,13 +975,13 @@ usage() {
 
   echo "${b}hrobot${n} — CLI for Hetzner Robot API (dedicated servers)"
   echo ""
-  echo "  Usage: hrobot ${bl}<command>${n} [args...]"
+  echo "  Usage: ${g}hr${n} ${bl}<command>${n} [args...]  ${d}(or: hrobot)${n}"
   echo ""
   echo "${b}AUTH${n}"
   echo "  ${g}auth${n}               Authenticate with Hetzner Robot API"
   echo "  ${g}status${n}             Check authentication and API connection"
   echo ""
-  echo "${b}SERVERS${n}"
+  echo "${b}SERVERS${n} ${d}— alias: ${g}s${n}"
   echo "  ${g}servers${n}            List all servers"
   echo "  ${g}server${n} <num>       Show server details"
   echo "  ${g}rename${n} <num> <n>   Rename a server"
@@ -956,16 +1009,22 @@ usage() {
   echo "  ${g}storageboxes${n}       List storage boxes"
   echo "  ${g}storagebox${n} <id>    Show storage box details"
   echo ""
-  echo "${b}SERVER MARKET${n} ${d}(auction / refurbished)${n}"
+  echo "${b}SERVER MARKET${n} ${d}(auction / refurbished) — alias: ${g}m${n}"
   echo "  ${g}market${n}             List auction servers ${d}(sorted by price)${n}"
   echo "  ${g}market show${n} <id>   Show server details"
   echo "  ${g}market buy${n} <id>    Order a server ${d}(with confirmation)${n}"
   echo "  ${g}market tx${n}          List market transactions"
   echo ""
-  echo "${b}SERVER CATALOG${n} ${d}(new / standard)${n}"
+  echo "  ${d}Filters:  --ram N  --price N  --dc X  --cpu X  --nvme  --ssd  --hdd  --ecc${n}"
+  echo "  ${d}Sort:     --sort price|ram|disk|drop${n}"
+  echo "  ${d}Example:  hr m --ram 64 --nvme --sort ram${n}"
+  echo ""
+  echo "${b}SERVER CATALOG${n} ${d}(new / standard) — alias: ${g}c${n}"
   echo "  ${g}catalog${n}            List dedicated servers with pricing"
   echo "  ${g}catalog show${n} <id>  Show server details, OS, locations"
   echo "  ${g}catalog buy${n} <id>   Order a server ${d}(with confirmation)${n}"
+  echo ""
+  echo "  ${d}Sort:     --sort price|ram|name${n}"
   echo ""
   echo "${b}OPTIONS${n}"
   echo "  ${g}-h${n}, ${g}--help${n}         Show this help"
@@ -984,7 +1043,7 @@ main() {
   case "$cmd" in
     auth)           cmd_auth "$@" ;;
     status)         cmd_status "$@" ;;
-    servers|ls)     cmd_servers "$@" ;;
+    servers|ls|s)   cmd_servers "$@" ;;
     server)         cmd_server "$@" ;;
     rename)         cmd_server_rename "$@" ;;
     reset)          cmd_reset "$@" ;;
@@ -996,16 +1055,16 @@ main() {
     ip)             cmd_ip "$@" ;;
     subnets)        cmd_subnets "$@" ;;
     rdns)           cmd_rdns "$@" ;;
-    firewall|fw)    cmd_firewall "$@" ;;
+    firewall|fw|f)  cmd_firewall "$@" ;;
     failover|fo)    cmd_failover "$@" ;;
     vswitch|vs)     cmd_vswitch "$@" ;;
-    traffic)        cmd_traffic "$@" ;;
-    keys)           cmd_keys "$@" ;;
+    traffic|t)      cmd_traffic "$@" ;;
+    keys|k)         cmd_keys "$@" ;;
     key)            cmd_key "$@" ;;
     storageboxes)   cmd_storageboxes "$@" ;;
     storagebox)     cmd_storagebox "$@" ;;
-    market|sb)      cmd_market "$@" ;;
-    catalog|new)    cmd_catalog "$@" ;;
+    market|sb|m)    cmd_market "$@" ;;
+    catalog|new|c)  cmd_catalog "$@" ;;
     -v|--version|version) echo "hrobot $VERSION" ;;
     -h|--help|help) usage ;;
     *)              die "Unknown command: $cmd. Run 'hrobot help' for usage." ;;
