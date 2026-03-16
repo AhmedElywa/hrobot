@@ -84,6 +84,9 @@ table() {
   data=$(jq -r "$jq_expr" 2>/dev/null) || true
 
   if [ -t 1 ]; then
+    local cols
+    cols=$(( $(tput cols 2>/dev/null || echo 120) - 3 ))
+
     echo ""
     echo -e "  ${BOLD}${title}${NC}"
     echo ""
@@ -94,6 +97,10 @@ table() {
       formatted=$( (echo -e "$headers" && echo "$data") | column -t -s $'\t' )
       local first=true
       while IFS= read -r line; do
+        # Truncate to terminal width
+        if [ "${#line}" -gt "$cols" ]; then
+          line="${line:0:$cols}…"
+        fi
         if $first; then
           echo -e "  ${DIM}${line}${NC}"
           first=false
@@ -671,14 +678,16 @@ cmd_catalog() {
       data=$(_catalog_fetch)
       # Deduplicate by name, pick cheapest variant per model
       echo "$data" | jq '.server' | table "DEDICATED SERVERS" \
-        "NAME\tCPU\tRAM\tDISK\tLOCATIONS\tFROM\tSETUP" \
-        '[.[] | select(.category != "Upfront")]
+        "NAME\tCPU\tRAM\tDISK\tDC\tFROM\tSETUP" \
+        'def short_disk: gsub("Datacenter Edition "; "DC ") | gsub("Datacenter Edition"; "DC") | gsub(" \\(Gen4\\)"; "") | gsub(" \\(Gen 4\\)"; "") | gsub(" \\(Gen3\\)"; "") | gsub(" \\(Gen 3\\)"; "");
+         def short_cpu: gsub("™"; "") | gsub("®"; "") | gsub(" Prozessor"; "");
+         [.[] | select(.category != "Upfront")]
          | sort_by(.price)[]
          | [
              .name,
-             .cpu,
+             (.cpu | short_cpu),
              (.ram | tostring) + "GB",
-             (.hdd_arr | first // "-"),
+             ((.hdd_count | tostring) + "x " + (.hdd_arr | first // "-" | short_disk)),
              ([.datacenter[].shortname] | join(",")),
              (.price | tostring) + "€",
              (if .setup_price == 0 then "free" else (.setup_price | tostring) + "€" end)
