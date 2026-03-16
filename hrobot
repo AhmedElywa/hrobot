@@ -464,7 +464,7 @@ cmd_market() {
       local count
       count=$(echo "$data" | jq '.server | length')
       echo "$data" | jq '.server' | table "SERVER AUCTION ($count servers)" \
-        "ID\tCPU\tRAM\tDISK\tDC\tNEXT DROP\tPRICE" \
+        "PRICE\tID\tCPU\tRAM\tDISK\tDC\tNEXT DROP" \
         'def fmt_disk:
            def disk_type:
              if (.serverDiskData.nvme | length) > 0 and (.serverDiskData.sata | length) > 0 then "NVMe+SSD"
@@ -485,13 +485,13 @@ cmd_market() {
          [.[] | {id, cpu, ram_size, hdd_count, hdd_size, hdd_arr, serverDiskData, datacenter, price, next_reduce, fixed_price}]
          | sort_by(.price)[]
          | [
+             (.price | tostring) + "€",
              .id,
              .cpu,
              (.ram_size | tostring) + "GB",
              fmt_disk,
              .datacenter,
-             (if .fixed_price then "fixed" else fmt_reduce end),
-             (.price | tostring) + "€"
+             (if .fixed_price then "fixed" else fmt_reduce end)
            ] | @tsv'
       ;;
     show|info)
@@ -678,19 +678,19 @@ cmd_catalog() {
       data=$(_catalog_fetch)
       # Deduplicate by name, pick cheapest variant per model
       echo "$data" | jq '.server' | table "DEDICATED SERVERS" \
-        "NAME\tCPU\tRAM\tDISK\tDC\tFROM\tSETUP" \
+        "FROM\tSETUP\tNAME\tCPU\tRAM\tDISK\tDC" \
         'def short_disk: gsub("Datacenter Edition "; "DC ") | gsub("Datacenter Edition"; "DC") | gsub(" \\(Gen4\\)"; "") | gsub(" \\(Gen 4\\)"; "") | gsub(" \\(Gen3\\)"; "") | gsub(" \\(Gen 3\\)"; "");
          def short_cpu: gsub("™"; "") | gsub("®"; "") | gsub(" Prozessor"; "");
          [.[] | select(.category != "Upfront")]
          | sort_by(.price)[]
          | [
+             (.price | tostring) + "€",
+             (if .setup_price == 0 then "free" else (.setup_price | tostring) + "€" end),
              .name,
              (.cpu | short_cpu),
              (.ram | tostring) + "GB",
              ((.hdd_count | tostring) + "x " + (.hdd_arr | first // "-" | short_disk)),
-             ([.datacenter[].shortname] | join(",")),
-             (.price | tostring) + "€",
-             (if .setup_price == 0 then "free" else (.setup_price | tostring) + "€" end)
+             ([.datacenter[].shortname] | join(","))
            ] | @tsv'
       ;;
     show|info)
