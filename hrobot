@@ -94,7 +94,9 @@ table() {
       echo -e "  ${DIM}(none)${NC}"
     else
       local formatted
-      formatted=$( (echo -e "$headers" && echo "$data") | column -t -s $'\t' )
+      # -c 1000: stop column(1) from silently dropping trailing columns when
+      # the table is wider than the detected terminal; we truncate ourselves
+      formatted=$( (echo -e "$headers" && echo "$data") | column -t -s $'\t' -c 1000 )
       local first=true
       while IFS= read -r line; do
         # Truncate to terminal width
@@ -112,7 +114,7 @@ table() {
     echo ""
   else
     if [ -n "$data" ]; then
-      (echo -e "$headers" && echo "$data") | column -t -s $'\t'
+      (echo -e "$headers" && echo "$data") | column -t -s $'\t' -c 1000
     fi
   fi
 }
@@ -437,21 +439,105 @@ cmd_cancel() {
 
 # ─── Order Commands ───────────────────────────────────────────────────
 
-SB_FEED="https://www.hetzner.com/_resources/app/data/app/live_data_sb_EUR.json"
+SB_FEED="https://www.hetzner.com/_resources/app/data/app/live_data_sb.json"
 CATALOG_FEED="https://www.hetzner.com/_resources/app/data/app/live_data_en_EUR.json"
+
+# jq def shared by market/catalog --sort cpu. Scores approximate multi-thread
+# Passmark in thousands, so the catalog feed's real cpuBenchmark (when present)
+# can be compared on the same scale via cpuBenchmark/1000. Unknown CPUs score 0
+# and sink to the bottom.
+CPU_SCORE_JQ='def cpu_score:
+  (ascii_downcase | gsub("™|®"; "")) as $c
+  | if   $c | test("gold 6787")       then 120
+    elif $c | test("epyc 94")         then 108
+    elif $c | test("epyc 9")          then 105
+    elif $c | test("xeon 6741")       then 100
+    elif $c | test("gold 6731")       then 90
+    elif $c | test("9950x")           then 66
+    elif $c | test("7950x")           then 63
+    elif $c | test("gold 5412")       then 55
+    elif $c | test("ultra 7 265")     then 54
+    elif $c | test("epyc 75")         then 48
+    elif $c | test("i9-13900")        then 42
+    elif $c | test("5950x")           then 39
+    elif $c | test("i9-12900")        then 35
+    elif $c | test("i5-13500")        then 32
+    elif $c | test("ryzen 9 39")      then 31
+    elif $c | test("8700ge")          then 30
+    elif $c | test("w-2295")          then 26
+    elif $c | test("3700x")           then 24
+    elif $c | test("threadripper")    then 23
+    elif $c | test("ryzen 5 3600")    then 20
+    elif $c | test("i9-9900")         then 18
+    elif $c | test("i7-8700")         then 13
+    elif $c | test("i7-6700|i7-7700") then 9
+    elif $c | test("e5-16")           then 10
+    elif $c | test("e3-12")           then 7
+    else 0 end;
+def cpu_rank: [-(if (.cpu_benchmark // 0) > 0 then .cpu_benchmark / 1000 else (.cpu | cpu_score) end), .price];'
 
 _sb_fetch() {
   local data
   data=$(curl -s "$SB_FEED") || die "Failed to fetch server market data"
   [ -n "$data" ] && echo "$data" | jq -e '.server' >/dev/null 2>&1 || die "Invalid response from server market"
-  echo "$data"
+  # Normalize the 2026 feed schema (PascalCase, nested) to the flat field
+  # names the rest of the market commands consume
+  echo "$data" | jq '{server: [.server[] | {
+    id: .Id,
+    cpu: .Hardware.CPU.Name,
+    cpu_count: .Hardware.CPU.CoreCount,
+    ram_size: .Hardware.RAM.Size,
+    ram: [.Details.Information[] | select(test("RAM"))],
+    is_ecc: .Hardware.RAM.ecc,
+    hdd_size: .Hardware.Storage.Size,
+    hdd_count: .Hardware.Storage.Amount,
+    hdd_arr: .Hardware.Storage.Disks,
+    hdd_hr: .Hardware.Storage.Disks,
+    serverDiskData: .Hardware.Storage.Details,
+    price: .Prices.monthly.EUR,
+    hourly_price: .Prices.hourly.EUR,
+    setup_price: .Prices.setup.EUR,
+    fixed_price: .Prices.fixed,
+    next_reduce: .Timer.ReduceNext,
+    datacenter: .Details.Datacenter.Name,
+    bandwidth: .Details.Bandwidth,
+    specials: .Details.Specials
+  }]}'
 }
 
 _catalog_fetch() {
   local data
   data=$(curl -s "$CATALOG_FEED") || die "Failed to fetch server catalog"
   [ -n "$data" ] && echo "$data" | jq -e '.server' >/dev/null 2>&1 || die "Invalid response from server catalog"
-  echo "$data"
+  # Normalize the 2026 feed schema (nested product/filterData/priceData) to the
+  # flat field names the rest of the catalog commands consume
+  echo "$data" | jq '{server: [.server[] | {
+    id: .product.id,
+    name: .name,
+    category: (.product.category // ""),
+    cpu: .cpuData.cpu,
+    cpu_benchmark: (.cpuData.cpuBenchmark // 0),
+    ram: .filterData.ramMin,
+    ram_hr: ((if .filterData.ramMin == .filterData.ramMax
+              then (.filterData.ramMin | tostring)
+              else (.filterData.ramMin | tostring) + "-" + (.filterData.ramMax | tostring) end)
+             + " GB" + (if .filterData.ramEcc then " ECC" else "" end)),
+    is_ecc: .filterData.ramEcc,
+    hdd_count: .filterData.driveAmount,
+    hdd_arr: [(.variations[0].drive // [])[]
+              | (.Size | tostring) + " " + (.SizeUnit // "GB") + " " + (.Type // "HDD")],
+    hdd_hr: [(.variations[0].drive // [])[]
+             | (.Amount | tostring) + " x " + (.Size | tostring) + " " + (.SizeUnit // "GB") + " " + (.Type // "HDD")],
+    price: .priceData.price,
+    maxPrice: .priceData.maxPrice,
+    setup_price: .priceData.setupPrice,
+    hourPrice: .priceData.hourPrice,
+    datacenter: [(.details.datacenter // {}) | keys[] | {shortname: .}],
+    bandwidth: .details.bandwidth,
+    specials: (.specials // []),
+    instant: .product.instantAvailable,
+    link: .product.link
+  }]}'
 }
 
 cmd_market() {
@@ -469,7 +555,7 @@ cmd_market() {
       --hdd)      disk_filter="hdd" ; shift ;;
       --ecc)      ecc_only=true ; shift ;;
       --sort)     sort_by="${2:-price}" ; shift 2 ;;
-      -*)         die "Unknown flag: $1. Filters: --ram N --price N --dc X --cpu X --nvme --ssd --hdd --ecc --sort price|ram|disk|drop" ;;
+      -*)         die "Unknown flag: $1. Filters: --ram N --price N --dc X --cpu X --nvme --ssd --hdd --ecc --sort price|ram|disk|drop|cpu" ;;
       *)          args+=("$1") ; shift ;;
     esac
   done
@@ -490,7 +576,8 @@ cmd_market() {
         --arg disk "$disk_filter" \
         --arg ecc "$ecc_only" \
         --arg sort "$sort_by" \
-        '[.server[]
+        "$CPU_SCORE_JQ"'
+         [.server[]
           | select(.ram_size >= $min_ram)
           | select(.price <= $max_price)
           | select(if $dc != "" then (.datacenter | ascii_downcase | contains($dc | ascii_downcase)) else true end)
@@ -503,6 +590,7 @@ cmd_market() {
         ] | sort_by(
           if $sort == "ram" then .ram_size
           elif $sort == "disk" then .hdd_size
+          elif $sort == "cpu" then cpu_rank
           elif $sort == "drop" then (if .fixed_price then 999999 else .next_reduce end)
           else .price end
         )')
@@ -559,7 +647,7 @@ cmd_market() {
         '.[] | .transaction | [.id, (.date | split("T") | first), .status, (.server_number // "-"), (.product.cpu // "-")] | @tsv'
       ;;
     *)
-      die "Unknown: $action. Usage: hrobot market [list|show <id>|buy <id>|tx] [--ram N --price N --dc X --cpu X --nvme --ssd --hdd --ecc --sort price|ram|disk|drop]"
+      die "Unknown: $action. Usage: hrobot market [list|show <id>|buy <id>|tx] [--ram N --price N --dc X --cpu X --nvme --ssd --hdd --ecc --sort price|ram|disk|drop|cpu]"
       ;;
   esac
 }
@@ -719,7 +807,7 @@ cmd_catalog() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --sort)  sort_by="${2:-price}" ; shift 2 ;;
-      -*)      die "Unknown flag: $1. Options: --sort price|ram|name" ;;
+      -*)      die "Unknown flag: $1. Options: --sort price|ram|name|cpu" ;;
       *)       args+=("$1") ; shift ;;
     esac
   done
@@ -728,21 +816,27 @@ cmd_catalog() {
 
   case "$action" in
     list|ls)
-      local data
+      local data sorted
       data=$(_catalog_fetch)
-      echo "$data" | jq --arg sort "$sort_by" '.server' | table "DEDICATED SERVERS" \
+      sorted=$(echo "$data" | jq --arg sort "$sort_by" \
+        "$CPU_SCORE_JQ"'
+         [.server[] | select(.category != "Upfront")]
+         | sort_by(
+             if $sort == "ram" then .ram
+             elif $sort == "name" then .name
+             elif $sort == "cpu" then cpu_rank
+             else .price end)')
+      echo "$sorted" | table "DEDICATED SERVERS" \
         "FROM\tSETUP\tNAME\tCPU\tRAM\tDISK\tDC" \
-        'def short_disk: gsub("Datacenter Edition "; "DC ") | gsub("Datacenter Edition"; "DC") | gsub(" \\(Gen4\\)"; "") | gsub(" \\(Gen 4\\)"; "") | gsub(" \\(Gen3\\)"; "") | gsub(" \\(Gen 3\\)"; "");
-         def short_cpu: gsub("™"; "") | gsub("®"; "") | gsub(" Prozessor"; "");
-         [.[] | select(.category != "Upfront")]
-         | sort_by(if $ARGS.named.sort == "ram" then .ram elif $ARGS.named.sort == "name" then .name else .price end)[]
+        'def short_cpu: gsub("™"; "") | gsub("®"; "") | gsub(" Prozessor"; "");
+         .[]
          | [
              (.price | tostring) + "€",
              (if .setup_price == 0 then "free" else (.setup_price | tostring) + "€" end),
              .name,
              (.cpu | short_cpu),
-             (.ram | tostring) + "GB",
-             ((.hdd_count | tostring) + "x " + (.hdd_arr | first // "-" | short_disk)),
+             .ram_hr,
+             ((.hdd_count | tostring) + "x " + (.hdd_arr | first // "-")),
              ([.datacenter[].shortname] | join(","))
            ] | @tsv'
       ;;
@@ -820,7 +914,7 @@ _catalog_detail() {
     echo -e "  ${DIM}Features${NC}    $specials"
     echo ""
     echo -e "  ${DIM}Pricing${NC}"
-    echo "$pricing" | while IFS= read -r line; do echo -e "$line"; done | column -t -s $'\t'
+    echo "$pricing" | while IFS= read -r line; do echo -e "$line"; done | column -t -s $'\t' -c 1000
     echo ""
   else
     echo "$base" | jq .
@@ -1016,7 +1110,7 @@ usage() {
   echo "  ${g}market tx${n}          List market transactions"
   echo ""
   echo "  ${d}Filters:  --ram N  --price N  --dc X  --cpu X  --nvme  --ssd  --hdd  --ecc${n}"
-  echo "  ${d}Sort:     --sort price|ram|disk|drop${n}"
+  echo "  ${d}Sort:     --sort price|ram|disk|drop|cpu${n}"
   echo "  ${d}Example:  hr m --ram 64 --nvme --sort ram${n}"
   echo ""
   echo "${b}SERVER CATALOG${n} ${d}(new / standard) — alias: ${g}c${n}"
@@ -1024,7 +1118,7 @@ usage() {
   echo "  ${g}catalog show${n} <id>  Show server details, OS, locations"
   echo "  ${g}catalog buy${n} <id>   Order a server ${d}(with confirmation)${n}"
   echo ""
-  echo "  ${d}Sort:     --sort price|ram|name${n}"
+  echo "  ${d}Sort:     --sort price|ram|name|cpu${n}"
   echo ""
   echo "${b}OPTIONS${n}"
   echo "  ${g}-h${n}, ${g}--help${n}         Show this help"
