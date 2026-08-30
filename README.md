@@ -86,6 +86,7 @@ hr m --sort price           # By price (default)
 hr m --sort ram             # By RAM size
 hr m --sort disk            # By disk size
 hr m --sort drop            # By next price drop (soonest first)
+hr m --sort cpu             # By CPU performance (best first)
 ```
 
 ### Server Catalog (new / standard)
@@ -94,10 +95,16 @@ Browse standard dedicated servers with per-location pricing.
 
 ```sh
 hr c                        # List all servers
-hr c show AX41-NVMe         # Details, pricing, OS options
-hr c buy AX41-NVMe          # Order with location selection
+hr c show AX41              # Details, pricing, locations
+hr c buy <product-id>       # Order with location selection
 hr c --sort ram             # Sort by RAM instead of price
+hr c --sort cpu             # Sort by CPU performance (best first)
 ```
+
+CPU sorting uses Hetzner's published benchmark score where the feed
+provides one, falling back to a built-in score map (`CPU_SCORE_JQ` in
+the script) — a brand-new CPU model may rank at the bottom until it is
+added there.
 
 ### Storage
 

@@ -11,8 +11,11 @@ Single-file Bash script (`hrobot`) with no dependencies beyond `curl` and `jq`. 
 **Data sources:**
 - Robot API (`robot-ws.your-server.de`) — server management, ordering, auth-required operations
 - Public Hetzner feeds (no auth needed):
-  - `live_data_sb_EUR.json` — server auction/market listings (700+ servers)
-  - `live_data_en_EUR.json` — standard server catalog (17 products)
+  - `live_data_sb.json` — server auction/market listings
+  - `live_data_en_EUR.json` — standard server catalog
+  - Both feeds use a nested PascalCase schema; `_sb_fetch()` and
+    `_catalog_fetch()` normalize it to the flat field names the rest of
+    the commands consume — schema changes get fixed there
 
 ## Commands
 
@@ -32,7 +35,7 @@ hr t <num> [daily|monthly|yearly]  # Traffic stats
 # Server market (auction) — no auth for listing
 hr m                 # List auction servers
 hr m --ram 64 --nvme --price 50  # Filter
-hr m --sort ram      # Sort by ram|price|disk|drop
+hr m --sort ram      # Sort by ram|price|disk|drop|cpu
 hr m show <id>       # Server details
 hr m buy <id>        # Order (with confirmation)
 hr m tx              # Transactions
@@ -41,7 +44,7 @@ hr m tx              # Transactions
 hr c                 # List standard servers
 hr c show <name>     # Details with pricing/OS
 hr c buy <id>        # Order (with confirmation)
-hr c --sort ram      # Sort by ram|price|name
+hr c --sort ram      # Sort by ram|price|name|cpu
 ```
 
 ## Development
